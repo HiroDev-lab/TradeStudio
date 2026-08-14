@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "skipLibCheck": true,
+    "strict": true,
+    "types": ["node"],
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "forceConsistentCasingInFileNames": true,
+    "outDir": ".vercel/output/functions/api",
+    "rootDir": "../"
+  },
+  "include": ["**/*.ts", "../lib/**/*.ts"],
+  "exclude": ["node_modules"]
+}
