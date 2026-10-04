@@ -8,7 +8,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "./ui/select";
-import { supabase } from "../../../lib/supabase";
+import { supabase, authHeader } from "../lib/supabase";
 import { ROLE_LABELS, AGENT_SECTORS } from "../../../constants";
 
 interface ApiUser {
@@ -39,12 +39,6 @@ function rolesQueCallerPodeConceder(caller: ApiUser | null): string[] {
 function validateEmail(email: string): boolean {
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   return emailRegex.test(email);
-}
-
-async function authHeader(): Promise<Record<string, string>> {
-  const { data } = await supabase.auth.getSession();
-  const token = data.session?.access_token;
-  return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
 // Modal Component
@@ -111,6 +105,8 @@ export default function UserManagement() {
   const [formData, setFormData] = useState({ email: "", setor: "", cargo: "colaborador" });
   const [errors, setErrors] = useState<{ [key: string]: string }>({});
   const [isSaving, setIsSaving] = useState(false);
+  // Senha provisória devolvida pelo servidor: aparece uma única vez, para o gestor repassar.
+  const [senhaProvisoria, setSenhaProvisoria] = useState<{ email: string; senha: string } | null>(null);
 
   const loadUsers = useCallback(async () => {
     setIsLoading(true);
@@ -199,12 +195,35 @@ export default function UserManagement() {
       const body = await res.json();
       if (!res.ok) throw new Error(body.error || "Erro ao conceder acesso.");
       toast.success("Acesso concedido!");
+      if (body.senhaProvisoria) setSenhaProvisoria({ email: formData.email.trim().toLowerCase(), senha: body.senhaProvisoria });
       setIsGrantModalOpen(false);
       setIsEditModalOpen(false);
       setSelectedUser(null);
       await loadUsers();
     } catch (err: any) {
       toast.error(err.message || "Erro ao conceder acesso.");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleResetPassword = async () => {
+    if (!selectedUser) return;
+    setIsSaving(true);
+    try {
+      const headers = await authHeader();
+      const res = await fetch("/api/admin-users", {
+        method: "POST",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "reset-password", id: selectedUser.id }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error || "Erro ao redefinir a senha.");
+      setSenhaProvisoria({ email: selectedUser.email, senha: body.senhaProvisoria });
+      setIsEditModalOpen(false);
+      setSelectedUser(null);
+    } catch (err: any) {
+      toast.error(err.message || "Erro ao redefinir a senha.");
     } finally {
       setIsSaving(false);
     }
@@ -277,7 +296,7 @@ export default function UserManagement() {
       </div>
 
       <p style={{ fontFamily: "Montserrat, sans-serif", fontSize: 11, color: "rgba(0,0,0,0.5)", margin: 0 }}>
-        Lista real de contas Google que já entraram no sistema (auth.users) e o cargo/setor concedido a cada uma (profiles). Quem ainda não tem cargo aparece como "Sem acesso" e não consegue usar o sistema.
+Contas cadastradas no sistema e o cargo/setor concedido a cada uma. Quem não tem cargo aparece como "Sem acesso" e não consegue usar o sistema.
       </p>
 
       {/* Search */}
@@ -440,7 +459,7 @@ export default function UserManagement() {
       <Modal isOpen={isGrantModalOpen} onClose={() => setIsGrantModalOpen(false)} title="CONCEDER ACESSO">
         <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
           <p style={{ fontFamily: "Montserrat, sans-serif", fontSize: 12, color: "#666", margin: 0 }}>
-            A pessoa precisa já ter entrado uma vez com o Google no sistema antes de você conceder acesso a ela.
+            Se o e-mail ainda não tem conta, ela é criada agora e você recebe uma senha provisória para repassar à pessoa.
           </p>
 
           <div>
@@ -577,7 +596,14 @@ export default function UserManagement() {
             {errors.setor && <span style={{ color: "#ff0000", fontSize: 11, marginTop: 4 }}>{errors.setor}</span>}
           </div>
 
-          <div style={{ display: "flex", gap: 12, justifyContent: "flex-end", marginTop: 8 }}>
+          <div style={{ display: "flex", gap: 12, justifyContent: "flex-end", marginTop: 8, flexWrap: "wrap" }}>
+            <button
+              onClick={handleResetPassword}
+              disabled={isSaving}
+              style={{ padding: "10px 20px", borderRadius: 8, border: "1px solid rgba(0,0,0,0.2)", background: "white", cursor: isSaving ? "default" : "pointer", fontFamily: "Montserrat, sans-serif", fontSize: 12, fontWeight: 500, marginRight: "auto" }}
+            >
+              REDEFINIR SENHA
+            </button>
             <button
               onClick={() => { setIsEditModalOpen(false); setSelectedUser(null); }}
               style={{ padding: "10px 20px", borderRadius: 8, border: "1px solid rgba(0,0,0,0.2)", background: "white", cursor: "pointer", fontFamily: "Montserrat, sans-serif", fontSize: 12, fontWeight: 500 }}
@@ -595,6 +621,34 @@ export default function UserManagement() {
         </div>
       </Modal>
 
+      <Modal isOpen={senhaProvisoria !== null} onClose={() => setSenhaProvisoria(null)} title="SENHA PROVISÓRIA">
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          <p style={{ fontFamily: "Montserrat, sans-serif", fontSize: 13, color: "#000", margin: 0 }}>
+            Repasse esta senha para <strong>{senhaProvisoria?.email}</strong>. No primeiro login a pessoa vai escolher uma senha nova.
+          </p>
+          <div style={{ fontFamily: "monospace", fontSize: 18, letterSpacing: 1, textAlign: "center", padding: "14px 12px", borderRadius: 8, background: "#f5f5f5", border: "1px solid rgba(0,0,0,0.12)", userSelect: "all" }}>
+            {senhaProvisoria?.senha}
+          </div>
+          <p style={{ fontFamily: "Montserrat, sans-serif", fontSize: 12, color: "#666", margin: 0 }}>
+            Ela não será mostrada de novo. Se perder, use "Redefinir senha" no usuário.
+          </p>
+          <div style={{ display: "flex", gap: 12, justifyContent: "flex-end", marginTop: 8 }}>
+            <button
+              onClick={() => { navigator.clipboard.writeText(senhaProvisoria?.senha || ""); toast.success("Senha copiada!"); }}
+              style={{ padding: "10px 20px", borderRadius: 8, border: "1px solid rgba(0,0,0,0.2)", background: "white", cursor: "pointer", fontFamily: "Montserrat, sans-serif", fontSize: 12, fontWeight: 500 }}
+            >
+              COPIAR
+            </button>
+            <button
+              onClick={() => setSenhaProvisoria(null)}
+              style={{ padding: "10px 20px", borderRadius: 8, border: "none", background: "#000", color: "white", cursor: "pointer", fontFamily: "Montserrat, sans-serif", fontSize: 12, fontWeight: 600 }}
+            >
+              JÁ ANOTEI
+            </button>
+          </div>
+        </div>
+      </Modal>
+
       {/* Revoke Confirmation Modal */}
       <Modal isOpen={isDeleteModalOpen} onClose={() => setIsDeleteModalOpen(false)} title="CONFIRMAR REVOGAÇÃO">
         <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
@@ -602,7 +656,7 @@ export default function UserManagement() {
             Tem certeza que deseja revogar o acesso de <strong>{selectedUser?.email}</strong>?
           </p>
           <p style={{ fontFamily: "Montserrat, sans-serif", fontSize: 12, color: "#666", margin: 0 }}>
-            A conta Google continua existindo, mas a pessoa perde o cargo/permissão no sistema.
+            A conta continua existindo, mas a pessoa perde o cargo/permissão no sistema.
           </p>
           <div style={{ display: "flex", gap: 12, justifyContent: "flex-end", marginTop: 8 }}>
             <button

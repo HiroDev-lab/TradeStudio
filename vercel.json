@@ -1,9 +1,11 @@
 {
   "version": 2,
+  "framework": "vite",
+  "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "functions": {
     "api/*.ts": {
-      "maxDuration": 30
+      "maxDuration": 60
     }
   },
   "headers": [
@@ -31,9 +33,9 @@
           "value": "camera=(), microphone=(), geolocation=(), interest-cohort=()"
         },
         {
-            "key": "Content-Security-Policy",
-            "value": "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://aistudiocdn.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https: blob:; connect-src 'self' https://*.supabase.co wss://*.supabase.co https://generativelanguage.googleapis.com https://api.openai.com https://*.google.com https://*.googleusercontent.com; frame-src 'self'; object-src 'none'; base-uri 'self';"
-          }
+          "key": "Content-Security-Policy",
+          "value": "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https: blob:; connect-src 'self' https://*.supabase.co wss://*.supabase.co https://generativelanguage.googleapis.com https://api.openai.com https://*.google.com https://*.googleusercontent.com; frame-src 'self'; object-src 'none'; base-uri 'self';"
+        }
       ]
     }
   ],
@@ -43,11 +45,7 @@
       "destination": "/api/chat?agentId=:agentId"
     },
     {
-      "source": "/api/(.*)",
-      "destination": "/api/$1"
-    },
-    {
-      "source": "/(.*)",
+      "source": "/((?!api/).*)",
       "destination": "/index.html"
     }
   ]

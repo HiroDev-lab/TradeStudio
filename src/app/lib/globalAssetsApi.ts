@@ -1,10 +1,4 @@
-import { supabase } from "../../../lib/supabase";
-
-async function authHeader(): Promise<Record<string, string>> {
-  const { data } = await supabase.auth.getSession();
-  const token = data.session?.access_token;
-  return token ? { Authorization: `Bearer ${token}` } : {};
-}
+import { authHeader } from "./supabase";
 
 export async function fetchGlobalAssets<T>(type: "knowledge" | "requests"): Promise<T[]> {
   const headers = await authHeader();

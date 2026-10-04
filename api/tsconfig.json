@@ -12,6 +12,6 @@
     "outDir": ".vercel/output/functions/api",
     "rootDir": "../"
   },
-  "include": ["**/*.ts", "../lib/**/*.ts"],
+  "include": ["**/*.ts", "../constants.ts"],
   "exclude": ["node_modules"]
 }

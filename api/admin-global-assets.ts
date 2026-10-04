@@ -1,31 +1,15 @@
-import { VercelRequest, VercelResponse } from '@vercel/node';
-import { supabase, supabaseServiceRole } from '../lib/supabase.js';
+import type { VercelRequest, VercelResponse } from '@vercel/node';
+import { supabaseServiceRole } from './_lib/supabase.js';
+import { preflight, requireCaller } from './_lib/http.js';
 
 /**
  * Ativos Globais (Conhecimento e Requisições).
  *
- * `global_knowledge` já existia no banco de produção (é lida de verdade por
- * api/chat.ts para montar o contexto dos agentes, com suporte a sync de
- * Google Docs/Sheets em `google_doc_id`/`cached_content`/`sync_interval`) —
- * por isso o mapeamento abaixo usa as colunas reais dela
- * (description/content/google_doc_id/sectors/is_public/allowed_roles), não um
- * schema inventado. `global_requests` é nova (ver
- * supabase/migrations/20260720_global_assets.sql), sem nenhum outro
- * consumidor ainda.
- *
- * Leitura liberada a qualquer usuário autenticado (agentes de qualquer setor
+ * Leitura liberada a qualquer usuário com acesso (os agentes de qualquer setor
  * precisam listar os ativos ao serem editados); escrita (criar/excluir)
- * restrita a quem já gerencia usuários (admin/dev/lider/master), pela mesma
- * regra de api/admin/users.ts.
+ * restrita a quem gerencia usuários (admin/dev/lider/master), pela mesma
+ * regra de api/admin-users.ts.
  */
-
-const allowedOrigins = [
-  'https://tradestudio-ai-studio.vercel.app',
-  'https://tradestars-ai-studio.vercel.app',
-  'https://tradestudio.com.br',
-  'http://localhost:5173',
-  'http://localhost:3000',
-];
 
 type AssetType = 'knowledge' | 'requests';
 
@@ -56,49 +40,11 @@ function requestFromRow(row: any): Record<string, any> {
   };
 }
 
-async function getCallerProfile(token: string) {
-  const { data: { user }, error } = await supabase.auth.getUser(token);
-  if (error || !user) return null;
-
-  const masterEmail = process.env.JUNOS_ADMIN_MASTER_EMAIL || process.env.VITE_ADMIN_MASTER_EMAIL;
-  const isMasterEmail = !!masterEmail && user.email === masterEmail;
-
-  const { data: profile } = await supabaseServiceRole
-    .from('profiles')
-    .select('*')
-    .eq('id', user.id)
-    .maybeSingle();
-
-  return {
-    user,
-    role: profile?.role as string | undefined,
-    isMaster: !!profile?.is_master || isMasterEmail,
-  };
-}
-
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  const origin = req.headers.origin;
-  if (origin && allowedOrigins.includes(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-  }
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'DENY');
+  if (preflight(req, res, 'GET, POST, DELETE')) return;
 
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-
-  const authHeader = req.headers.authorization;
-  if (!authHeader) {
-    return res.status(401).json({ error: 'Identidade não estabelecida. Forneça um Token de Sessão válido.' });
-  }
-
-  const caller = await getCallerProfile(authHeader.replace('Bearer ', ''));
-  if (!caller) {
-    return res.status(403).json({ error: 'Token inválido ou expirado.' });
-  }
+  const caller = await requireCaller(req, res);
+  if (!caller) return;
 
   const type = (req.query.type as string) || req.body?.type;
   if (type !== 'knowledge' && type !== 'requests') {
@@ -114,7 +60,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).json({ items: (data || []).map(mapRow) });
     }
 
-    const podeGerenciar = caller.isMaster || ['admin', 'dev', 'lider'].includes(caller.role || '');
+    const podeGerenciar = caller.isGestor || caller.role === 'lider';
     if (!podeGerenciar) {
       return res.status(403).json({ error: 'Você não tem permissão para gerenciar ativos globais.' });
     }
@@ -136,6 +82,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
               is_public: true,
               allowed_roles: [],
               sync_interval: 24,
+              created_by: caller.user.id,
             }
           : {
               title: body.title,
@@ -165,7 +112,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     return res.status(405).json({ error: 'Method not allowed' });
   } catch (err: any) {
-    console.error('[API] Erro em /api/admin/global-assets:', err);
+    console.error('[api/admin-global-assets] Erro:', err);
     return res.status(500).json({ error: 'Erro interno no servidor' });
   }
 }

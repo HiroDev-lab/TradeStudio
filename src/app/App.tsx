@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, ReactNode } from "react";
+import { useState, useEffect, useMemo, useRef, ReactNode } from "react";
 import { useNavigate, useLocation, Navigate } from "react-router-dom";
 import {
   Plus, Trash2, ChevronLeft, Save, RotateCcw,
@@ -6,9 +6,10 @@ import {
   RefreshCw, Copy, Info, User, Sparkles, FileText, BookOpen, Zap
 } from "lucide-react";
 import { toast } from "sonner";
-import GroupScrollbar from "@/imports/Group116";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import UserManagement from "./components/UserManagement";
-import { supabase } from "../../lib/supabase";
+import { supabase, authHeader } from "./lib/supabase";
 import * as agentsApi from "./lib/agentsApi";
 import { fetchGlobalAssets, createGlobalAsset, deleteGlobalAsset } from "./lib/globalAssetsApi";
 import {
@@ -57,6 +58,8 @@ const F = {
 };
 
 // ─── Types ───────────────────────────────────────────────────────────────────
+export type Provider = "gemini" | "openai" | "openrouter";
+
 export interface AttachedDoc { id: string; name: string; size: number; type: "pdf" | "docx"; content: string }
 
 export interface Agent {
@@ -69,12 +72,27 @@ export interface Agent {
     topP: number;
     reasoning: boolean;
     maxTokens: number;
-    modelosCustomizados: { id: string; nome: string; modelId: string; provider: "gemini" | "openai"; apiKey: string }[];
+    modelosCustomizados: { id: string; nome: string; modelId: string; provider: Provider; apiKey: string }[];
+    // Existe uma chave de API própria salva no servidor para este agente (ela nunca vem para o navegador).
+    chaveSalva: { provider: Provider } | null;
   };
   embed: { linkCompartilhamento: string; iframe: string; chatWidget: string };
   isGlobal: boolean; dataCriacao: string;
 }
 type Tab = "geral" | "inteligencia" | "persona" | "conhecimento" | "requisicoes";
+
+const MAX_TOKENS_PADRAO = 4096;
+const MAX_TOKENS_LIMITE = 32768;
+// O texto dos anexos vai inteiro no prompt; acima disso estoura o contexto dos modelos.
+const MAX_CARACTERES_POR_DOCUMENTO = 150_000;
+
+const PROVIDER_LABELS: Record<Provider, string> = { gemini: "Gemini", openai: "OpenAI", openrouter: "OpenRouter" };
+
+// Provedor do modelo escolhido. Sem modelo, o agente usa o padrão configurado no servidor.
+function providerLabel(agent: Agent): string {
+  const selected = agent.inteligencia.modelosCustomizados.find(m => m.nome === agent.inteligencia.modelo);
+  return selected ? PROVIDER_LABELS[selected.provider] : "IA padrão";
+}
 
 function newAgent(): Agent {
   const id = crypto.randomUUID();
@@ -82,12 +100,8 @@ function newAgent(): Agent {
     id, nome: "", descricao: "", avatar: "", emoji: "🤖", persona: "",
     conhecimento: { documentos: [], baseLocal: "", conhecimentoGlobal: [] },
     requisicoes: { globais: [], personalizadas: [] },
-    inteligencia: { modelo: "", temperatura: 20.20, topP: 20.07, reasoning: false, maxTokens: 2020207, modelosCustomizados: [] },
-    embed: {
-      linkCompartilhamento: `https://agentes.app/chat/${id}`,
-      iframe: `<iframe src="https://agentes.app/embed/${id}" width="400" height="600"></iframe>`,
-      chatWidget: `<script src="https://agentes.app/widget.js" data-agent="${id}"></script>`,
-    },
+    inteligencia: { modelo: "", temperatura: 0.7, topP: 0.85, reasoning: false, maxTokens: MAX_TOKENS_PADRAO, modelosCustomizados: [], chaveSalva: null },
+    embed: agentsApi.embedFor(id),
     isGlobal: false, dataCriacao: new Date().toISOString(),
   };
 }
@@ -532,7 +546,7 @@ function Dashboard({ agents, onNew, onEdit, onDelete, onDuplicate }: {
                   )}
                 </div>
                 <div style={{ background: "white", borderRadius: 4, padding: "4px 10px" }}>
-                  <span style={{ fontFamily: "Montserrat, sans-serif", fontSize: 15, color: "black" }}>Gemini</span>
+                  <span style={{ fontFamily: "Montserrat, sans-serif", fontSize: 15, color: "black" }}>{providerLabel(agent)}</span>
                 </div>
               </div>
 
@@ -688,9 +702,17 @@ function GlobalAssetsView() {
         overflow: "hidden",
       }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 20, flexWrap: "wrap" }}>
-          <h1 style={{ fontFamily: "Montserrat, sans-serif", fontSize: 24, fontWeight: 700, color: "#000", margin: 0 }}>
-            Ativos Globais
-          </h1>
+          <div style={{ minWidth: 0, flex: "1 1 320px" }}>
+            <h1 style={{ fontFamily: "Montserrat, sans-serif", fontSize: 24, fontWeight: 700, color: "#000", margin: 0 }}>
+              Ativos Globais
+            </h1>
+            <p style={{ fontFamily: "Montserrat, sans-serif", fontSize: 12, color: "rgba(0,0,0,0.6)", margin: "6px 0 0", maxWidth: 720 }}>
+              Materiais cadastrados uma vez e reaproveitados por vários agentes. Um <strong>conhecimento</strong> global
+              (regras da empresa, tabela de preços, FAQ) pode ser ligado a qualquer agente na aba Conhecimento; ao
+              atualizar aqui, todos os agentes que o usam passam a responder com a versão nova. As <strong>requisições</strong> globais
+              são chamadas a sistemas externos (webhooks) que os agentes poderão acionar.
+            </p>
+          </div>
           <button
             type="button"
             onClick={() => activeTab === "requisicoes" ? setNewGlobalRequestOpen(true) : setNewGlobalKnowledgeOpen(true)}
@@ -1285,7 +1307,7 @@ function NovoConhecimentoGlobalModal({
 
               <div>
                 <div style={{ fontFamily: "Montserrat, sans-serif", fontSize: 10, fontWeight: 800, color: "rgba(0,0,0,0.68)", marginBottom: 6 }}>
-                  BREVE DESCRITIVO DO AGENTE
+                  BREVE DESCRITIVO
                 </div>
                 <textarea
                   value={breveDescritivo}
@@ -1339,7 +1361,7 @@ function NovoConhecimentoGlobalModal({
                 <input
                   value={googleDocsId}
                   onChange={e => setGoogleDocsId(e.target.value)}
-                  placeholder="ID do Google Docs"
+                  placeholder="Link do Google Docs (compartilhado por link)"
                   style={{
                     width: "100%",
                     height: 42,
@@ -1537,7 +1559,7 @@ function NovoRequisicaoGlobalModal({
   };
 
   const handleDescricaoChange = (value: string) => {
-    const sanitized = value.replace(/[^a-zA-Z0-9\s.,!?;:'"()-]/g, '');
+    const sanitized = value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '');
     if (sanitized.length <= 500) {
       setBreveDescritivo(sanitized);
     }
@@ -1848,11 +1870,11 @@ function NovoModeloModal({
 }: {
   open: boolean;
   onClose: () => void;
-  onSave: (model: { id: string; nome: string; modelId: string; provider: "gemini" | "openai"; apiKey: string }) => void;
+  onSave: (model: { id: string; nome: string; modelId: string; provider: Provider; apiKey: string }) => void;
 }) {
   const [nome, setNome] = useState("");
   const [modelId, setModelId] = useState("");
-  const [provider, setProvider] = useState<"gemini" | "openai">("gemini");
+  const [provider, setProvider] = useState<Provider>("gemini");
   const [apiKey, setApiKey] = useState("");
 
   useEffect(() => {
@@ -1866,7 +1888,7 @@ function NovoModeloModal({
 
   if (!open) return null;
 
-  const canSave = nome.trim() && modelId.trim() && apiKey.trim();
+  const canSave = nome.trim() && modelId.trim();
 
   return (
     <div
@@ -1937,7 +1959,7 @@ function NovoModeloModal({
             <input
               value={modelId}
               onChange={e => setModelId(e.target.value)}
-              placeholder="ex: gpt-5-preview"
+              placeholder={provider === "openrouter" ? "ex: qwen/qwen3.8-27b:free" : provider === "openai" ? "ex: gpt-4o-mini" : "ex: gemini-2.5-flash"}
               style={{
                 width: "100%",
                 height: 42,
@@ -1958,7 +1980,7 @@ function NovoModeloModal({
             <div style={{ fontFamily: "Montserrat, sans-serif", fontSize: 10, fontWeight: 700, color: "rgba(0,0,0,0.68)", marginBottom: 6 }}>
               PROVEDOR
             </div>
-            <Select value={provider} onValueChange={(value: string) => setProvider(value as "gemini" | "openai")}>
+            <Select value={provider} onValueChange={(value: string) => setProvider(value as Provider)}>
               <SelectTrigger style={{
                 width: "100%",
                 height: 42,
@@ -1973,18 +1995,19 @@ function NovoModeloModal({
               <SelectContent className="z-[1000000]">
                 <SelectItem value="gemini">Google Gemini</SelectItem>
                 <SelectItem value="openai">OpenAI</SelectItem>
+                <SelectItem value="openrouter">OpenRouter</SelectItem>
               </SelectContent>
             </Select>
           </div>
 
           <div>
             <div style={{ fontFamily: "Montserrat, sans-serif", fontSize: 10, fontWeight: 700, color: "rgba(0,0,0,0.68)", marginBottom: 6 }}>
-              CHAVE DE API
+              CHAVE DE API (OPCIONAL)
             </div>
             <input
               value={apiKey}
               onChange={e => setApiKey(e.target.value)}
-              placeholder={provider === "openai" ? "sk-..." : "AIza..."}
+              placeholder="Em branco, usa a chave padrão da empresa"
               type="password"
               autoComplete="off"
               style={{
@@ -2065,6 +2088,12 @@ function ChatPreview({ agent }: { agent: Agent }) {
   const [messages, setMessages] = useState<{ role: "user" | "bot"; text: string }[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  const [conversationId, setConversationId] = useState<string | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+  }, [messages, sending]);
 
   async function send() {
     if (!input.trim() || sending) return;
@@ -2074,8 +2103,9 @@ function ChatPreview({ agent }: { agent: Agent }) {
     setSending(true);
     try {
       const history = messages.map(m => ({ role: (m.role === "user" ? "user" : "assistant") as "user" | "assistant", content: m.text }));
-      const reply = await agentsApi.chatWithAgent(agent, history, txt);
-      setMessages(m => [...m, { role: "bot", text: reply || "(sem resposta)" }]);
+      const reply = await agentsApi.chatWithAgent(agent, history, txt, conversationId);
+      setConversationId(reply.conversationId);
+      setMessages(m => [...m, { role: "bot", text: reply.content || "(sem resposta)" }]);
     } catch (err: any) {
       setMessages(m => [...m, { role: "bot", text: `Erro: ${err?.message || "falha ao falar com a IA."}` }]);
     } finally {
@@ -2088,7 +2118,7 @@ function ChatPreview({ agent }: { agent: Agent }) {
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 12px 8px", flexShrink: 0 }}>
         <span style={{ fontFamily: "Montserrat, sans-serif", fontWeight: 600, fontSize: 11, color: "#222" }}>{agent.nome || "Preview"}</span>
         <button
-          onClick={() => setMessages([])}
+          onClick={() => { setMessages([]); setConversationId(null); }}
           style={{
             display: "flex",
             alignItems: "center",
@@ -2109,7 +2139,7 @@ function ChatPreview({ agent }: { agent: Agent }) {
         </button>
       </div>
 
-      <div style={{ flex: 1, padding: "10px 14px 0", display: "flex", flexDirection: "column", gap: 12, minHeight: 0 }}>
+      <div ref={scrollRef} style={{ flex: 1, padding: "10px 14px", display: "flex", flexDirection: "column", gap: 12, minHeight: 0, overflowY: "auto" }}>
         {messages.length === 0 && (
           <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14 }}>
             <div style={{ width: 78, height: 78, borderRadius: 28, background: "#f7f7f7", display: "flex", alignItems: "center", justifyContent: "center" }}>
@@ -2120,11 +2150,18 @@ function ChatPreview({ agent }: { agent: Agent }) {
         )}
         {messages.map((m, i) => (
           <div key={i} style={{ display: "flex", justifyContent: m.role === "user" ? "flex-end" : "flex-start" }}>
-            <div style={{ maxWidth: "75%", padding: "8px 14px", borderRadius: 12, background: m.role === "user" ? "black" : "#f5f5f5", color: m.role === "user" ? "white" : "black", fontFamily: "Montserrat, sans-serif", fontSize: 13 }}>
-              {m.text}
+            <div className="chat-md" style={{ maxWidth: "88%", padding: "8px 14px", borderRadius: 12, background: m.role === "user" ? "black" : "#f5f5f5", color: m.role === "user" ? "white" : "black", fontFamily: "Montserrat, sans-serif", fontSize: 13, whiteSpace: m.role === "user" ? "pre-wrap" : "normal" }}>
+              {m.role === "user" ? m.text : <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.text}</ReactMarkdown>}
             </div>
           </div>
         ))}
+        {sending && (
+          <div style={{ display: "flex", justifyContent: "flex-start" }}>
+            <div style={{ padding: "8px 14px", borderRadius: 12, background: "#f5f5f5", fontFamily: "Montserrat, sans-serif", fontSize: 12, color: "rgba(0,0,0,0.5)" }}>
+              Digitando...
+            </div>
+          </div>
+        )}
       </div>
 
       <div style={{ padding: "12px 12px 14px", flexShrink: 0 }}>
@@ -2163,7 +2200,7 @@ function TabGeral({ agent, onChange }: { agent: Agent; onChange: (a: Agent) => v
   }
 
   function handleDescricaoChange(value: string) {
-    const sanitized = value.replace(/[^a-zA-Z0-9\s.,!?;:'"()-]/g, '');
+    const sanitized = value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '');
     if (sanitized.length <= 500) {
       onChange({ ...agent, descricao: sanitized });
     }
@@ -2438,7 +2475,7 @@ function TabInteligencia({ agent, onChange }: { agent: Agent; onChange: (a: Agen
             {modelOptions.length === 0 && (
               <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center", padding: 16 }}>
                 <span style={{ fontFamily: "Montserrat, sans-serif", fontSize: 11, color: "rgba(0,0,0,0.5)" }}>
-                  Nenhum modelo configurado. Clique em "+ Modelo Customizado" para adicionar o modelo real da IA.
+                  Nenhum modelo escolhido: o agente usa a IA padrão da empresa. Para usar outro modelo, clique em "+ Modelo Customizado".
                 </span>
               </div>
             )}
@@ -2534,7 +2571,7 @@ function TabInteligencia({ agent, onChange }: { agent: Agent; onChange: (a: Agen
                   <span style={{ fontFamily: "Montserrat, sans-serif", fontSize: 9 }}>{intel[s.key].toFixed(2)}</span>
                 </div>
               </div>
-              <input type="range" min={0} max={100} step={0.01} value={intel[s.key]}
+              <input type="range" min={0} max={s.key === "temperatura" ? 2 : 1} step={0.01} value={intel[s.key]}
                 onChange={e => onChange({ ...agent, inteligencia: { ...intel, [s.key]: parseFloat(e.target.value) } })}
                 disabled={intel.reasoning}
                 style={{ width: "100%", accentColor: "black" }} />
@@ -2584,14 +2621,14 @@ function TabInteligencia({ agent, onChange }: { agent: Agent; onChange: (a: Agen
                 const value = parseInt(e.target.value);
                 if (isNaN(value) || value < 1) {
                   onChange({ ...agent, inteligencia: { ...intel, maxTokens: 1 } });
-                } else if (value > 4096) {
-                  onChange({ ...agent, inteligencia: { ...intel, maxTokens: 4096 } });
+                } else if (value > MAX_TOKENS_LIMITE) {
+                  onChange({ ...agent, inteligencia: { ...intel, maxTokens: MAX_TOKENS_LIMITE } });
                 } else {
                   onChange({ ...agent, inteligencia: { ...intel, maxTokens: value } });
                 }
               }}
               min={1}
-              max={4096}
+              max={MAX_TOKENS_LIMITE}
               className="no-spinner"
               style={{ 
                 width: 70, 
@@ -2712,18 +2749,29 @@ function TabConhecimento({ agent, onChange }: { agent: Agent; onChange: (a: Agen
     const newFiles: AttachedDoc[] = [];
     for (const file of validFiles) {
       const isDocx = file.name.toLowerCase().endsWith('.docx');
-      let content = `[Arquivo PDF anexado: ${file.name}]`;
-      if (isDocx) {
-        try {
+      let content = '';
+      try {
+        if (isDocx) {
           const mammoth = await import('mammoth');
           const arrayBuffer = await file.arrayBuffer();
           const result = await mammoth.extractRawText({ arrayBuffer });
           content = result.value;
-        } catch (err) {
-          console.error('[TabConhecimento] Erro ao extrair texto do .docx:', err);
-          toast.error(`Não foi possível extrair o texto de ${file.name}.`);
-          continue;
+        } else {
+          const { extractPdfText } = await import('./lib/pdf');
+          content = await extractPdfText(file);
         }
+      } catch (err) {
+        console.error('[TabConhecimento] Erro ao extrair texto do arquivo:', err);
+        toast.error(`Não foi possível extrair o texto de ${file.name}.`);
+        continue;
+      }
+      if (!content.trim()) {
+        toast.error(`${file.name} não tem texto para ler (PDF digitalizado ou arquivo vazio).`);
+        continue;
+      }
+      if (content.length > MAX_CARACTERES_POR_DOCUMENTO) {
+        content = content.slice(0, MAX_CARACTERES_POR_DOCUMENTO);
+        toast.warning(`${file.name} é muito grande: só o começo (${MAX_CARACTERES_POR_DOCUMENTO.toLocaleString('pt-BR')} caracteres) foi anexado.`);
       }
       newFiles.push({
         id: crypto.randomUUID(),
@@ -2753,13 +2801,13 @@ function TabConhecimento({ agent, onChange }: { agent: Agent; onChange: (a: Agen
     try {
       const response = await fetch('/api/sync-google', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...(await authHeader()) },
         body: JSON.stringify({ url: docsUrl.trim() }),
       });
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => null);
-        throw new Error(errorData?.message || errorData?.error || `Erro ${response.status} ao sincronizar.`);
+        throw new Error(errorData?.error || `Erro ${response.status} ao sincronizar.`);
       }
 
       const text = await response.text();
@@ -2914,7 +2962,7 @@ function TabConhecimento({ agent, onChange }: { agent: Agent; onChange: (a: Agen
         <LabelWithInfo label="BASE DE CONHECIMENTO LOCAL (LOCAL)" />
         <textarea value={con.baseLocal} onChange={e => onChange({ ...agent, conhecimento: { ...con, baseLocal: e.target.value } })}
           placeholder="Exemplo: Temos um bônus x que deve ser ofertado."
-          style={{ width: "100%", height: 82, border: "1px solid #d7d7d7", borderRadius: 4, padding: 12, fontFamily: "Montserrat, sans-serif", fontSize: 10, outline: "none", resize: "none", background: "white", boxSizing: "border-box" }} />
+          style={{ width: "100%", height: 150, minHeight: 82, border: "1px solid #d7d7d7", borderRadius: 4, padding: 12, fontFamily: "Montserrat, sans-serif", fontSize: 11, outline: "none", resize: "vertical", background: "white", boxSizing: "border-box" }} />
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         <span style={{ fontFamily: "Montserrat, sans-serif", fontSize: 10, color: "rgba(0,0,0,0.68)", fontWeight: 500 }}>CONHECIMENTOS GLOBAIS</span>
@@ -3270,13 +3318,75 @@ function formatLogTimestamp(timestamp: number): string {
   return `${day}/${month}/${year}, ${hours}:${minutes}:${seconds}`;
 }
 
-async function fetchHistoryLogs(): Promise<any[]> {
-  const { data } = await supabase.auth.getSession();
-  const token = data.session?.access_token;
-  const res = await fetch("/api/history", { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+async function fetchHistoryLogs(tipo: "conversas" | "requisicoes" = "conversas"): Promise<any[]> {
+  const res = await fetch(tipo === "requisicoes" ? "/api/history?tipo=requisicoes" : "/api/history", { headers: await authHeader() });
   const body = await res.json();
   if (!res.ok) throw new Error(body.error || "Erro ao carregar histórico.");
   return body;
+}
+
+type LogMessage = { role: string; content: string };
+
+async function fetchConversationMessages(id: string): Promise<LogMessage[]> {
+  const res = await fetch(`/api/history?id=${encodeURIComponent(id)}`, { headers: await authHeader() });
+  const body = await res.json();
+  if (!res.ok) throw new Error(body.error || "Erro ao carregar a conversa.");
+  return body.messages || [];
+}
+
+// Detalhe de uma linha de Logs/Histórico. `mensagens` nulo = ainda carregando.
+function LogDetailModal({ titulo, log, mensagens, onClose }: {
+  titulo: string;
+  log: { horario: string; usuario: string; agente: string; status: string };
+  mensagens: LogMessage[] | null;
+  onClose: () => void;
+}) {
+  const statusColor = log.status === "Sucesso" ? "#059669" : "#dc2626";
+  return (
+    <div
+      style={{ position: "fixed", inset: 0, background: "rgba(0, 0, 0, 0.32)", backdropFilter: "blur(4px)", display: "flex", alignItems: "center", justifyContent: "center", padding: 12, zIndex: 999999 }}
+      onClick={onClose}
+    >
+      <div
+        onClick={e => e.stopPropagation()}
+        style={{ width: "100%", maxWidth: 720, maxHeight: "90vh", display: "flex", flexDirection: "column", borderRadius: 10, border: "1px solid #dfdfdf", background: "white", boxShadow: "0 18px 40px rgba(0,0,0,0.18)", padding: 24, color: "black", boxSizing: "border-box" }}
+      >
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, flexShrink: 0 }}>
+          <h2 style={{ fontFamily: "Montserrat, sans-serif", fontSize: 20, fontWeight: 700, margin: 0 }}>{titulo}</h2>
+          <button onClick={onClose} aria-label="Fechar" style={{ background: "transparent", border: "none", cursor: "pointer", padding: 4, fontSize: 24, lineHeight: 1 }}>×</button>
+        </div>
+
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "6px 20px", marginBottom: 14, flexShrink: 0, fontFamily: "Montserrat, sans-serif", fontSize: 12 }}>
+          <span><strong style={{ color: "#666" }}>Horário:</strong> {log.horario}</span>
+          <span><strong style={{ color: "#666" }}>Usuário:</strong> {log.usuario}</span>
+          <span><strong style={{ color: "#666" }}>Agente:</strong> {log.agente}</span>
+          <span style={{ padding: "2px 8px", borderRadius: 999, fontSize: 10, fontWeight: 600, background: `${statusColor}20`, color: statusColor }}>{log.status}</span>
+        </div>
+
+        <div style={{ flex: 1, minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column", gap: 10, padding: 12, borderRadius: 8, background: "#fafafa", border: "1px solid #eee" }}>
+          {mensagens === null && (
+            <span style={{ fontFamily: "Montserrat, sans-serif", fontSize: 12, color: "#666" }}>Carregando conversa...</span>
+          )}
+          {mensagens?.length === 0 && (
+            <span style={{ fontFamily: "Montserrat, sans-serif", fontSize: 12, color: "#666" }}>Sem mensagens registradas.</span>
+          )}
+          {mensagens?.map((m, i) => (
+            <div key={i} style={{ display: "flex", justifyContent: m.role === "user" ? "flex-end" : "flex-start" }}>
+              <div className="chat-md" style={{ maxWidth: "88%", padding: "8px 14px", borderRadius: 12, background: m.role === "user" ? "black" : "white", color: m.role === "user" ? "white" : "black", border: m.role === "user" ? "none" : "1px solid #e5e5e5", fontFamily: "Montserrat, sans-serif", fontSize: 13, whiteSpace: m.role === "user" ? "pre-wrap" : "normal" }}>
+                {m.role === "user" ? m.content : <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 16, flexShrink: 0 }}>
+          <button onClick={onClose} style={{ height: 36, padding: "0 16px", background: "#000", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", fontFamily: "Montserrat, sans-serif", fontSize: 12, fontWeight: 600 }}>
+            Fechar
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function Logs() {
@@ -3285,22 +3395,27 @@ function Logs() {
   const [isLoadingLogs, setIsLoadingLogs] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [selectedLog, setSelectedLog] = useState<any>(null);
 
   const loadLogs = async () => {
     setLoadError(null);
     try {
-      const raw = await fetchHistoryLogs();
+      const raw = await fetchHistoryLogs("requisicoes");
       const mapped = raw
         .map(h => ({
           id: h.id,
           horario: formatLogTimestamp(h.timestamp),
-          usuario: "—",
+          usuario: h.userEmail || "—",
           agente: h.agentName,
           setor: "—",
           requisicao: (h.input || "").length > 80 ? `${h.input.slice(0, 80)}…` : (h.input || "—"),
-          telefone: "—",
+          telefone: h.phone || "—",
           status: h.status === "success" ? "Sucesso" : "Erros",
           timestamp: h.timestamp,
+          mensagens: [
+            { role: "user", content: h.input || "—" },
+            { role: "assistant", content: h.output || "—" },
+          ],
         }))
         .sort((a, b) => b.timestamp - a.timestamp);
       setLogs(mapped);
@@ -3862,7 +3977,7 @@ function Logs() {
             </thead>
             <tbody>
               {filteredLogs.map((log, index) => (
-                <tr key={log.id} style={{ background: index % 2 === 0 ? "#fff" : "#fafafa" }}>
+                <tr key={log.id} onClick={() => setSelectedLog(log)} title="Clique para ver a pergunta e a resposta" style={{ background: index % 2 === 0 ? "#fff" : "#fafafa", cursor: "pointer" }}>
                   <td style={{ padding: "12px 16px", borderBottom: "1px solid #f0f0f0", fontFamily: "Montserrat, sans-serif", fontSize: 14, color: "#333" }}>
                     {log.horario}
                   </td>
@@ -3875,7 +3990,7 @@ function Logs() {
                   <td style={{ padding: "12px 16px", borderBottom: "1px solid #f0f0f0", fontFamily: "Montserrat, sans-serif", fontSize: 14, color: "#333" }}>
                     {log.setor}
                   </td>
-                  <td style={{ padding: "12px 16px", borderBottom: "1px solid #f0f0f0", fontFamily: "Montserrat, sans-serif", fontSize: 14, color: "#333" }}>
+                  <td style={{ padding: "12px 16px", borderBottom: "1px solid #f0f0f0", fontFamily: "Montserrat, sans-serif", fontSize: 14, color: "#2563eb", textDecoration: "underline" }}>
                     {log.requisicao}
                   </td>
                   <td style={{ padding: "12px 16px", borderBottom: "1px solid #f0f0f0", fontFamily: "Montserrat, sans-serif", fontSize: 14, color: "#333" }}>
@@ -3917,6 +4032,15 @@ function Logs() {
           </table>
         </div>
       </div>
+
+      {selectedLog && (
+        <LogDetailModal
+          titulo="Detalhes da Requisição"
+          log={selectedLog}
+          mensagens={selectedLog.mensagens}
+          onClose={() => setSelectedLog(null)}
+        />
+      )}
       <style>{`
         @keyframes spin {
           from { transform: rotate(0deg); }
@@ -3932,7 +4056,19 @@ function SystemLogs() {
   const [logs, setLogs] = useState<any[]>([]);
   const [filteredLogs, setFilteredLogs] = useState<any[]>([]);
   const [selectedLog, setSelectedLog] = useState<any>(null);
+  const [selectedMessages, setSelectedMessages] = useState<LogMessage[] | null>(null);
   const [isLoadingLogs, setIsLoadingLogs] = useState(true);
+
+  const openLog = async (log: any) => {
+    setSelectedLog(log);
+    setSelectedMessages(null);
+    try {
+      setSelectedMessages(await fetchConversationMessages(log.id));
+    } catch (err: any) {
+      toast.error(err.message || "Erro ao carregar a conversa.");
+      setSelectedMessages([]);
+    }
+  };
   const [loadError, setLoadError] = useState<string | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
 
@@ -3944,14 +4080,13 @@ function SystemLogs() {
         .map(h => ({
           id: h.id,
           horario: formatLogTimestamp(h.timestamp),
-          usuario: "—",
+          usuario: h.userEmail || "—",
           agente: h.agentName,
           setor: "—",
           evento: (h.input || "").length > 60 ? `${h.input.slice(0, 60)}…` : (h.input || "—"),
           telefone: "—",
           status: h.status === "success" ? "Sucesso" : "Erros",
           timestamp: h.timestamp,
-          detalhes: `Pergunta: ${h.input || "—"}\n\nResposta: ${h.output || "—"}`,
         }))
         .sort((a, b) => b.timestamp - a.timestamp);
       setLogs(mapped);
@@ -4355,7 +4490,7 @@ function SystemLogs() {
                   </td>
                   <td style={{ padding: "12px 16px", borderBottom: "1px solid #f0f0f0", fontFamily: "Montserrat, sans-serif", fontSize: 14, color: "#333" }}>
                     <button
-                      onClick={() => setSelectedLog(log)}
+                      onClick={() => openLog(log)}
                       style={{
                         background: "transparent",
                         border: "none",
@@ -4411,108 +4546,13 @@ function SystemLogs() {
         </div>
       </div>
 
-      {/* Modal for details */}
       {selectedLog && (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(0, 0, 0, 0.32)",
-            backdropFilter: "blur(4px)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            padding: 12,
-            zIndex: 999999,
-          }}
-          onClick={() => setSelectedLog(null)}
-        >
-          <div
-            onClick={e => e.stopPropagation()}
-            style={{
-              width: "100%",
-              maxWidth: 600,
-              borderRadius: 10,
-              border: "1px solid #dfdfdf",
-              background: "white",
-              boxShadow: "0 18px 40px rgba(0,0,0,0.18)",
-              padding: 24,
-              color: "black",
-            }}
-          >
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
-              <h2 style={{ fontFamily: "Montserrat, sans-serif", fontSize: 20, fontWeight: 700, margin: 0 }}>Detalhes do Evento</h2>
-              <button
-                onClick={() => setSelectedLog(null)}
-                style={{
-                  background: "transparent",
-                  border: "none",
-                  cursor: "pointer",
-                  padding: 4,
-                  fontSize: 24,
-                  lineHeight: 1
-                }}
-              >
-                ×
-              </button>
-            </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-              <div>
-                <span style={{ fontFamily: "Montserrat, sans-serif", fontSize: 12, fontWeight: 600, color: "#666" }}>Horário: </span>
-                <span style={{ fontFamily: "Montserrat, sans-serif", fontSize: 12, color: "#000" }}>{selectedLog.horario}</span>
-              </div>
-              <div>
-                <span style={{ fontFamily: "Montserrat, sans-serif", fontSize: 12, fontWeight: 600, color: "#666" }}>Usuário: </span>
-                <span style={{ fontFamily: "Montserrat, sans-serif", fontSize: 12, color: "#000" }}>{selectedLog.usuario}</span>
-              </div>
-              <div>
-                <span style={{ fontFamily: "Montserrat, sans-serif", fontSize: 12, fontWeight: 600, color: "#666" }}>Agente: </span>
-                <span style={{ fontFamily: "Montserrat, sans-serif", fontSize: 12, color: "#000" }}>{selectedLog.agente}</span>
-              </div>
-              <div>
-                <span style={{ fontFamily: "Montserrat, sans-serif", fontSize: 12, fontWeight: 600, color: "#666" }}>Setor: </span>
-                <span style={{ fontFamily: "Montserrat, sans-serif", fontSize: 12, color: "#000" }}>{selectedLog.setor}</span>
-              </div>
-              <div>
-                <span style={{ fontFamily: "Montserrat, sans-serif", fontSize: 12, fontWeight: 600, color: "#666" }}>Evento: </span>
-                <span style={{ fontFamily: "Montserrat, sans-serif", fontSize: 12, color: "#000" }}>{selectedLog.evento}</span>
-              </div>
-              <div>
-                <span style={{ fontFamily: "Montserrat, sans-serif", fontSize: 12, fontWeight: 600, color: "#666" }}>Status: </span>
-                <span style={{
-                  display: "inline-block", padding: "2px 8px", borderRadius: 999, fontSize: 10, fontWeight: 600,
-                  background: `${getStatusColor(selectedLog.status)}20`, color: getStatusColor(selectedLog.status),
-                  fontFamily: "Montserrat, sans-serif"
-                }}>
-                  {selectedLog.status}
-                </span>
-              </div>
-              <div style={{ marginTop: 8 }}>
-                <span style={{ fontFamily: "Montserrat, sans-serif", fontSize: 12, fontWeight: 600, color: "#666", display: "block", marginBottom: 4 }}>Detalhes Completos:</span>
-                <p style={{ fontFamily: "Montserrat, sans-serif", fontSize: 12, color: "#000", margin: 0, lineHeight: 1.6 }}>{selectedLog.detalhes}</p>
-              </div>
-            </div>
-            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 24 }}>
-              <button
-                onClick={() => setSelectedLog(null)}
-                style={{
-                  height: 36,
-                  padding: "0 16px",
-                  background: "#000",
-                  color: "#fff",
-                  border: "none",
-                  borderRadius: 8,
-                  cursor: "pointer",
-                  fontFamily: "Montserrat, sans-serif",
-                  fontSize: 12,
-                  fontWeight: 600
-                }}
-              >
-                Fechar
-              </button>
-            </div>
-          </div>
-        </div>
+        <LogDetailModal
+          titulo="Conversa"
+          log={selectedLog}
+          mensagens={selectedMessages}
+          onClose={() => setSelectedLog(null)}
+        />
       )}
       </div>
       <style>{`
@@ -4631,7 +4671,14 @@ export default function App() {
   }
 
   async function handleDuplicate(a: Agent) {
-    const copy: Agent = { ...a, id: crypto.randomUUID(), nome: `${a.nome} (COPIA)`, dataCriacao: new Date().toISOString() };
+    const copy: Agent = {
+      ...a,
+      id: crypto.randomUUID(),
+      nome: `${a.nome} (CÓPIA)`,
+      // A chave de API própria fica no servidor e não é copiada junto.
+      inteligencia: { ...a.inteligencia, chaveSalva: null },
+      dataCriacao: new Date().toISOString(),
+    };
     try {
       const saved = await agentsApi.saveAgent(copy);
       setAgents(p => [...p, saved]);
@@ -4647,6 +4694,8 @@ export default function App() {
     ? decodeURIComponent(pathname.slice("/agentes/".length))
     : null;
   const editingAgent = editingAgentId ? agents.find(a => a.id === editingAgentId) ?? null : null;
+  const draftAgent = useMemo(() => newAgent(), [isNewAgentRoute]);
+  const editorAgent = isNewAgentRoute ? draftAgent : editingAgent;
   const isEditorRoute = isNewAgentRoute || editingAgentId !== null;
   const isKnownRoute = isEditorRoute || Object.values(SIDEBAR_ID_TO_PATH).includes(pathname);
 
@@ -4743,20 +4792,15 @@ export default function App() {
           )
         )}
 
-        {isNewAgentRoute && (
+        {isEditorRoute && editorAgent && (
           <AgentEditor
-            initial={newAgent()}
+            key={editorAgent.id}
+            initial={editorAgent}
             onBack={() => navigate(SIDEBAR_ID_TO_PATH.dashboard)}
-            onSave={async a => { await handleSave(a); navigate(SIDEBAR_ID_TO_PATH.dashboard); }}
-          />
-        )}
-
-        {editingAgentId !== null && editingAgent && (
-          <AgentEditor
-            key={editingAgent.id}
-            initial={editingAgent}
-            onBack={() => navigate(SIDEBAR_ID_TO_PATH.dashboard)}
-            onSave={async a => { await handleSave(a); navigate(SIDEBAR_ID_TO_PATH.dashboard); }}
+            onSave={async a => {
+              await handleSave(a);
+              if (isNewAgentRoute) navigate(`/agentes/${encodeURIComponent(a.id)}`, { replace: true });
+            }}
           />
         )}
 
