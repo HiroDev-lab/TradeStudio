@@ -72,3 +72,5 @@ Endpoints:
 - Tela para o próprio usuário trocar a senha fora do primeiro login.
 
 Interface original no Figma: https://www.figma.com/design/tFdpks6l1YyJL1qCoe97Tr/IA-Agent-Management-Frontend
+
+<!-- PR de teste: alteração inofensiva para validar o fluxo de branch/PR. -->
